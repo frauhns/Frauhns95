@@ -8,6 +8,7 @@ export async function onRequest(context) {
     }
 
     const tracks = data.tracks.data.map(track => ({
+      id: track.id,
       name: track.title,
       artist: track.artist.name,
       album: track.album.title,
@@ -18,7 +19,10 @@ export async function onRequest(context) {
     }));
 
     return new Response(JSON.stringify({ tracks }), {
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      },
     });
 
   } catch (err) {

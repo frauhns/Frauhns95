@@ -480,15 +480,31 @@ function getPreviewOffset(track) {
     return DEFAULT_PREVIEW_OFFSET;
 }
 
-function setPlaying(state) {
-    isPlaying = state;
-    musPlayBtn.classList.toggle("active", isPlaying);
-    musPlayIcon.src = isPlaying ? "icons/system/pause.png" : "icons/system/play.png";
-
-    if (isPlaying) {
-        audioEl.play();
-    } else {
+async function setPlaying(state) {
+    if (!state) {
+        isPlaying = false;
+        musPlayBtn.classList.remove("active");
+        musPlayIcon.src = "icons/system/play.png";
         audioEl.pause();
+        return;
+    }
+
+    try {
+        await audioEl.play();
+        isPlaying = true;
+        musPlayBtn.classList.add("active");
+        musPlayIcon.src = "icons/system/pause.png";
+    } catch (err) {
+        isPlaying = false;
+        musPlayBtn.classList.remove("active");
+        musPlayIcon.src = "icons/system/play.png";
+        console.error("Audio playback failed:", {
+            error: err,
+            src: audioEl.currentSrc,
+            networkState: audioEl.networkState,
+            readyState: audioEl.readyState,
+            mediaError: audioEl.error,
+        });
     }
 }
 
@@ -520,7 +536,9 @@ function showTrack(index) {
     musicArt.src = track.cover;
 
     audioEl.pause();
-    audioEl.src = track.preview || "";
+    audioEl.src = track.id
+        ? `/api/preview?id=${encodeURIComponent(track.id)}`
+        : track.preview || "";
     audioEl.currentTime = 0;
 
     updateQueuePage();
@@ -529,7 +547,7 @@ function showTrack(index) {
     loadLyrics(track);
 
     if (isPlaying) {
-        audioEl.play();
+        setPlaying(true);
     } else {
         musPlayBtn.classList.remove("active");
         musPlayIcon.src = "icons/system/play.png";
@@ -644,6 +662,15 @@ musPlayBtn.addEventListener("click", () => setPlaying(!isPlaying));
 
 audioEl.addEventListener("timeupdate", () => {
     updateLyricForTime(audioEl.currentTime + currentPreviewOffset);
+});
+
+audioEl.addEventListener("error", () => {
+    console.error("Audio element error:", {
+        src: audioEl.currentSrc,
+        networkState: audioEl.networkState,
+        readyState: audioEl.readyState,
+        mediaError: audioEl.error,
+    });
 });
 
 audioEl.addEventListener("ended", () => {
