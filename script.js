@@ -418,7 +418,7 @@ fetch("/api/posts")
 
 // THEME SWAP
 const themeBtns = document.querySelectorAll(".theme .btn[data-theme]");
-const THEMES = ["gray", "pink", "blue", "green", "amber", "violet", "brown", "red"];
+const THEMES = ["gray", "orange", "blue", "green", "yellow", "violet", "teal", "red"];
 const THEME_KEY = "frauhns95-theme";
 
 function setTheme(name){
@@ -430,7 +430,11 @@ function setTheme(name){
 }
 
 themeBtns.forEach(btn => btn.addEventListener("click", () => setTheme(btn.dataset.theme)));
-setTheme(localStorage.getItem(THEME_KEY) || "gray");
+// renamed themes: map old saved values to their closest replacement
+const LEGACY_THEMES = { amber: "yellow", lime: "green" };
+const savedTheme = localStorage.getItem(THEME_KEY);
+const startTheme = LEGACY_THEMES[savedTheme] || savedTheme;
+setTheme(THEMES.includes(startTheme) ? startTheme : "gray");
 
 // MUSIC PLAYLIST
 const musicTtl = document.querySelector(".track-title");
@@ -451,6 +455,15 @@ function setLyricText(text) {
 let tracks = [];
 let trackIndex = 0;
 let isPlaying = false;
+
+// race guards: ignore results from superseded play/lyrics requests
+let playToken = 0;
+let lyricsToken = 0;
+
+// error recovery: direct-URL fallback per track, skip limit across tracks
+let triedDirect = false;
+let failStreak = 0;
+const MAX_FAIL_STREAK = 3;
 
 let lyricLines = [];
 const audioEl = new Audio();
@@ -487,10 +500,6 @@ function setPlayUi(playing) {
     musPlayIcon.src = playing ? "icons/system/pause.png" : "icons/system/play.png";
 }
 
-let playToken = 0;
-let failStreak = 0;
-let triedDirect = false;
-
 async function setPlaying(state) {
     const token = ++playToken;
 
@@ -502,16 +511,15 @@ async function setPlaying(state) {
 
     if (!audioEl.src) return;
 
-    // optimistic UI: don't wait on network
+    // update UI immediately; don't wait on the network
     setPlayUi(true);
 
     try {
         await audioEl.play();
         if (token === playToken) failStreak = 0;
     } catch (err) {
-        // superseded by newer play/pause/track change
-        if (err && err.name === "AbortError") return;
-        if (token !== playToken) return;
+        // superseded by a newer play/pause/track change
+        if (err?.name === "AbortError" || token !== playToken) return;
         console.error("Audio playback failed:", {
             error: err,
             src: audioEl.currentSrc,
@@ -519,8 +527,8 @@ async function setPlaying(state) {
             readyState: audioEl.readyState,
             mediaError: audioEl.error,
         });
-        // autoplay block etc: revert. Media errors handled by "error" listener.
-        if (err && err.name === "NotAllowedError") setPlayUi(false);
+        // browser blocked playback; media errors are handled by the "error" listener
+        if (err?.name === "NotAllowedError") setPlayUi(false);
     }
 }
 
@@ -601,8 +609,6 @@ function parseLrc(lrcText) {
 
     return parsed;
 }
-
-let lyricsToken = 0;
 
 async function loadLyrics(track) {
     const myToken = ++lyricsToken;
@@ -697,7 +703,7 @@ audioEl.addEventListener("error", () => {
     const track = tracks[trackIndex];
     if (!track || !audioEl.src) return;
 
-    // 1st: fall back to direct Deezer preview URL
+    // 1) retry once with the direct Deezer preview URL
     if (!triedDirect && track.preview && !audioEl.src.endsWith(track.preview)) {
         triedDirect = true;
         audioEl.src = track.preview;
@@ -706,9 +712,9 @@ audioEl.addEventListener("error", () => {
         return;
     }
 
-    // 2nd: skip to next track while playing, bail after 3 straight fails
+    // 2) skip to the next track while playing; give up after repeated failures
     failStreak++;
-    if (isPlaying && failStreak < 3 && tracks.length > 1) {
+    if (isPlaying && failStreak < MAX_FAIL_STREAK && tracks.length > 1) {
         showTrack(trackIndex + 1);
     } else {
         setPlayUi(false);

@@ -27,7 +27,7 @@ async function fetchPlaylist() {
 
 export async function onRequest(context) {
   const cache = caches.default;
-  const cacheKey = new Request(new URL("/api/playlist", context.request.url).toString());
+  const cacheKey = new Request(new URL("/api/playlist?v=2", context.request.url).toString());
 
   try {
     const cached = await cache.match(cacheKey);
@@ -44,7 +44,7 @@ export async function onRequest(context) {
     }
 
     const tracks = data.tracks.data
-      .filter(track => track && track.id && track.readable !== false)
+      .filter(track => track && track.id)
       .map(track => ({
         id: track.id,
         name: track.title,
@@ -55,6 +55,11 @@ export async function onRequest(context) {
         preview: track.preview,
         duration: track.duration,
       }));
+
+    if (!tracks.length) {
+      if (cached) return cached;
+      return json({ error: "Empty playlist from Deezer" }, 502);
+    }
 
     const body = JSON.stringify({ tracks });
     const toStore = new Response(body, {
