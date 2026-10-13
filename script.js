@@ -465,6 +465,7 @@ const PLAYLIST_PAGE_SIZE = 15;
 async function loadPreviewOffsets() {
     try {
         const res = await fetch("/api/offsets");
+        if (!res.ok) throw new Error(`offsets ${res.status}`);
         previewOffsetOverrides = await res.json();
     } catch (err) {
         previewOffsetOverrides = {};
@@ -480,24 +481,37 @@ function getPreviewOffset(track) {
     return DEFAULT_PREVIEW_OFFSET;
 }
 
+function setPlayUi(playing) {
+    isPlaying = playing;
+    musPlayBtn.classList.toggle("active", playing);
+    musPlayIcon.src = playing ? "icons/system/pause.png" : "icons/system/play.png";
+}
+
+let playToken = 0;
+let failStreak = 0;
+let triedDirect = false;
+
 async function setPlaying(state) {
+    const token = ++playToken;
+
     if (!state) {
-        isPlaying = false;
-        musPlayBtn.classList.remove("active");
-        musPlayIcon.src = "icons/system/play.png";
+        setPlayUi(false);
         audioEl.pause();
         return;
     }
 
+    if (!audioEl.src) return;
+
+    // optimistic UI: don't wait on network
+    setPlayUi(true);
+
     try {
         await audioEl.play();
-        isPlaying = true;
-        musPlayBtn.classList.add("active");
-        musPlayIcon.src = "icons/system/pause.png";
+        if (token === playToken) failStreak = 0;
     } catch (err) {
-        isPlaying = false;
-        musPlayBtn.classList.remove("active");
-        musPlayIcon.src = "icons/system/play.png";
+        // superseded by newer play/pause/track change
+        if (err && err.name === "AbortError") return;
+        if (token !== playToken) return;
         console.error("Audio playback failed:", {
             error: err,
             src: audioEl.currentSrc,
@@ -505,6 +519,8 @@ async function setPlaying(state) {
             readyState: audioEl.readyState,
             mediaError: audioEl.error,
         });
+        // autoplay block etc: revert. Media errors handled by "error" listener.
+        if (err && err.name === "NotAllowedError") setPlayUi(false);
     }
 }
 
@@ -535,11 +551,12 @@ function showTrack(index) {
     musicArtist.textContent = track.artist;
     musicArt.src = track.cover;
 
+    triedDirect = false;
     audioEl.pause();
     audioEl.src = track.id
         ? `/api/preview?id=${encodeURIComponent(track.id)}`
         : track.preview || "";
-    audioEl.currentTime = 0;
+    audioEl.load();
 
     updateQueuePage();
     updateMusicCount();
@@ -549,8 +566,7 @@ function showTrack(index) {
     if (isPlaying) {
         setPlaying(true);
     } else {
-        musPlayBtn.classList.remove("active");
-        musPlayIcon.src = "icons/system/play.png";
+        setPlayUi(false);
     }
 }
 
@@ -586,7 +602,10 @@ function parseLrc(lrcText) {
     return parsed;
 }
 
+let lyricsToken = 0;
+
 async function loadLyrics(track) {
+    const myToken = ++lyricsToken;
     lyricLines = [];
     currentPreviewOffset = getPreviewOffset(track);
     setLyricText("looking for lyrics...");
@@ -595,6 +614,7 @@ async function loadLyrics(track) {
         const durationParam = track.duration ? `&duration=${encodeURIComponent(track.duration)}` : "";
         const res = await fetch(`/api/lyrics?artist=${encodeURIComponent(track.artist)}&title=${encodeURIComponent(track.name)}${durationParam}`);
         const data = await res.json();
+        if (myToken !== lyricsToken) return;
 
         if (!data.syncedLyrics) {
             setLyricText("no lyrics yet");
@@ -610,6 +630,7 @@ async function loadLyrics(track) {
 
         updateLyricForTime(currentPreviewOffset);
     } catch (err) {
+        if (myToken !== lyricsToken) return;
         setLyricText("lyrics didn't load, try again later");
         console.error(err);
     }
@@ -632,6 +653,7 @@ function updateLyricForTime(currentTime) {
 async function loadPlaylist() {
     try {
         const res = await fetch("/api/playlist");
+        if (!res.ok) throw new Error(`playlist ${res.status}`);
         const data = await res.json();
         tracks = data.tracks;
 
@@ -671,11 +693,33 @@ audioEl.addEventListener("error", () => {
         readyState: audioEl.readyState,
         mediaError: audioEl.error,
     });
+
+    const track = tracks[trackIndex];
+    if (!track || !audioEl.src) return;
+
+    // 1st: fall back to direct Deezer preview URL
+    if (!triedDirect && track.preview && !audioEl.src.endsWith(track.preview)) {
+        triedDirect = true;
+        audioEl.src = track.preview;
+        audioEl.load();
+        if (isPlaying) setPlaying(true);
+        return;
+    }
+
+    // 2nd: skip to next track while playing, bail after 3 straight fails
+    failStreak++;
+    if (isPlaying && failStreak < 3 && tracks.length > 1) {
+        showTrack(trackIndex + 1);
+    } else {
+        setPlayUi(false);
+        failStreak = 0;
+        setLyricText("couldn't play this track, try another");
+    }
 });
 
 audioEl.addEventListener("ended", () => {
+    // showTrack already resumes playback when isPlaying
     showTrack(trackIndex + 1);
-    setPlaying(true);
 });
 
 loadPreviewOffsets().then(loadPlaylist);
