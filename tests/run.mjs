@@ -98,8 +98,17 @@ await test("sends User-Agent to lrclib", async () => {
   await lyrics(ctx("https://x/api/lyrics?artist=A&title=B"));
   assert.match(ua, /Frauhns95/);
 });
+await test("KV only stores lyrics for playlist songs (public endpoint can't fill KV)", async () => {
+  const kv = new Map(); const env = { SITE_KV: { get: async (k) => kv.has(k) ? JSON.parse(kv.get(k)) : null, put: async (k, v) => kv.set(k, v) } };
+  kv.set("playlist:v2", JSON.stringify({ tracks: [{ name: "B", artist: "A" }] }));
+  mockFetch(() => J([{ trackName: "Z", artistName: "Q", duration: 100, syncedLyrics: LRC }]));
+  const pending = []; const c = ctx("https://x/api/lyrics?artist=Q&title=Z&duration=100", {}, env); c.waitUntil = (p) => pending.push(p);
+  assert.equal((await lyrics(c)).status, 200); await Promise.all(pending);
+  assert.equal([...kv.keys()].filter((k) => k.startsWith("lyrics:")).length, 0);
+});
 await test("KV hit skips network; KV miss stores", async () => {
   const kv = new Map(); const env = { SITE_KV: { get: async (k) => kv.has(k) ? JSON.parse(kv.get(k)) : null, put: async (k, v) => kv.set(k, v) } };
+  kv.set("playlist:v2", JSON.stringify({ tracks: [{ name: "B", artist: "A" }] }));
   let calls = 0; mockFetch(() => { calls++; return J([{ trackName: "B", artistName: "A", duration: 100, syncedLyrics: LRC }]); });
   const c1 = ctx("https://x/api/lyrics?artist=A&title=B&duration=100", {}, env);
   const pending = []; c1.waitUntil = (p) => pending.push(p);

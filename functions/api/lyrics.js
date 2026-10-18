@@ -57,6 +57,20 @@ async function sha1(text) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// Only songs that are really in the playlist may be written to KV. The endpoint is public, so without this
+// anyone could fill the store (and burn the daily write budget) with made-up artist/title pairs.
+async function isPlaylistSong(kv, artist, title) {
+  if (!kv) return false;
+  try {
+    const pl = await kv.get("playlist:v2", "json");
+    const a = fold(artist);
+    const t = fold(title);
+    return !!pl?.tracks?.some((x) => fold(x.name) === t && fold(x.artist) === a);
+  } catch (_) {
+    return false;
+  }
+}
+
 function toList(data) {
   if (!data) return [];
   return Array.isArray(data) ? data : [data];
@@ -166,15 +180,22 @@ export async function onRequest(context) {
     return reply({ error: "lookup failed", retryable: true }, 503, "no-store");
   }
 
+  const save = async (value, ttl) => {
+    if (await isPlaylistSong(kv, artist, title)) await kv.put(cacheKey, JSON.stringify(value), { expirationTtl: ttl });
+  };
+  const saveLater = (value, ttl) => {
+    if (kv) context.waitUntil(save(value, ttl).catch(() => {}));
+  };
+
   if (result.found) {
     const body = { ...result.found };
-    if (kv) context.waitUntil(kv.put(cacheKey, JSON.stringify(body), { expirationTtl: FOUND_TTL_S }).catch(() => {}));
+    saveLater(body, FOUND_TTL_S);
     return reply(body, 200, "public, max-age=3600");
   }
 
   if (result.instrumental) {
     const body = { instrumental: true };
-    if (kv) context.waitUntil(kv.put(cacheKey, JSON.stringify(body), { expirationTtl: FOUND_TTL_S }).catch(() => {}));
+    saveLater(body, FOUND_TTL_S);
     return reply(body, 200, "public, max-age=3600");
   }
 
@@ -183,6 +204,6 @@ export async function onRequest(context) {
     return reply({ error: "lyrics provider unavailable", retryable: true }, 503, "no-store");
   }
 
-  if (kv) context.waitUntil(kv.put(cacheKey, JSON.stringify({ notFound: true }), { expirationTtl: MISS_TTL_S }).catch(() => {}));
+  saveLater({ notFound: true }, MISS_TTL_S);
   return reply({ error: "not_found", notFound: true }, 404, "public, max-age=300");
 }
