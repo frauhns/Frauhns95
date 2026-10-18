@@ -448,7 +448,10 @@ const musPlayBtn = document.querySelector('[data-action="play"]');
 const musPlayIcon = musPlayBtn.querySelector("img");
 const musNextBtn = document.querySelector('[data-action="next"]');
 
+let lyricShown = null;
 function setLyricText(text) {
+    if (text === lyricShown) return;
+    lyricShown = text;
     musicLyric.textContent = text;
 }
 
@@ -456,17 +459,8 @@ let tracks = [];
 let trackIndex = 0;
 let isPlaying = false;
 
-// race guards: ignore results from superseded play/lyrics requests
-let playToken = 0;
-let lyricsToken = 0;
-
-// error recovery: direct-URL fallback per track, skip limit across tracks
-let triedDirect = false;
-let failStreak = 0;
-const MAX_FAIL_STREAK = 3;
-
-let lyricLines = [];
 const audioEl = new Audio();
+audioEl.preload = "auto";
 audioEl.volume = 0.75;
 
 const DEFAULT_PREVIEW_OFFSET = 48;
@@ -475,13 +469,44 @@ let previewOffsetOverrides = {};
 
 const PLAYLIST_PAGE_SIZE = 15;
 
+// tiny safe localStorage helpers (private mode / quota must never break the player)
+const store = {
+    get(key) {
+        try { return JSON.parse(localStorage.getItem(key)); } catch (_) { return null; }
+    },
+    set(key, value) {
+        try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
+    },
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// fetch that always has a timeout and can be aborted from outside
+async function fetchTimeout(url, ms, outerSignal) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ms);
+    const onAbort = () => ctl.abort();
+    if (outerSignal) {
+        if (outerSignal.aborted) ctl.abort();
+        else outerSignal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+        return await fetch(url, { signal: ctl.signal });
+    } finally {
+        clearTimeout(timer);
+        if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
+    }
+}
+
 async function loadPreviewOffsets() {
     try {
-        const res = await fetch("/api/offsets");
+        const res = await fetchTimeout("/api/offsets", 6000);
         if (!res.ok) throw new Error(`offsets ${res.status}`);
-        previewOffsetOverrides = await res.json();
+        const data = await res.json();
+        previewOffsetOverrides = data && typeof data === "object" ? data : {};
+        store.set("offsets:v2", previewOffsetOverrides);
     } catch (err) {
-        previewOffsetOverrides = {};
+        previewOffsetOverrides = store.get("offsets:v2") || {};
         console.error("couldn't load offsets", err);
     }
 }
@@ -489,7 +514,8 @@ async function loadPreviewOffsets() {
 function getPreviewOffset(track) {
     if (!track) return DEFAULT_PREVIEW_OFFSET;
     if (Object.prototype.hasOwnProperty.call(previewOffsetOverrides, track.name)) {
-        return previewOffsetOverrides[track.name];
+        const v = Number(previewOffsetOverrides[track.name]);
+        if (Number.isFinite(v)) return v;
     }
     return DEFAULT_PREVIEW_OFFSET;
 }
@@ -500,38 +526,125 @@ function setPlayUi(playing) {
     musPlayIcon.src = playing ? "icons/system/pause.png" : "icons/system/play.png";
 }
 
-async function setPlaying(state) {
-    const token = ++playToken;
+// ---------------------------------------------------------------
+// AUDIO: per-track ladder of sources, stall watchdog, race guards
+// ---------------------------------------------------------------
+// rung 1: our proxy (hands it the page's preview URL as a hint)
+// rung 2: our proxy, forced to re-resolve a fresh signed URL
+// rung 3: Deezer's preview URL directly
+const STALL_MS = 14000;
+const MAX_FAIL_STREAK = 3;
 
-    if (!state) {
-        setPlayUi(false);
-        audioEl.pause();
+let session = 0;        // bumps on every track change; stale async work compares against it
+let playToken = 0;      // bumps on every play/pause request
+let srcList = [];
+let srcIdx = 0;
+let stallTimer = null;
+let failStreak = 0;
+
+function sourcesFor(track) {
+    const list = [];
+    if (track.id) {
+        const id = encodeURIComponent(track.id);
+        const hint = track.preview ? `&hint=${encodeURIComponent(track.preview)}` : "";
+        list.push(`/api/preview?id=${id}${hint}`);
+        list.push(`/api/preview?id=${id}&refresh=1&_=${Date.now()}`);
+    }
+    if (track.preview) list.push(track.preview);
+    return list;
+}
+
+function clearStall() {
+    clearTimeout(stallTimer);
+    stallTimer = null;
+}
+
+function armStall() {
+    clearStall();
+    const mine = session;
+    stallTimer = setTimeout(() => {
+        if (mine === session && audioEl.readyState < 2) advanceSource("stalled");
+    }, STALL_MS);
+}
+
+function loadCurrentSource() {
+    audioEl.src = srcList[srcIdx];
+    audioEl.load();
+    armStall();
+}
+
+function advanceSource(reason) {
+    clearStall();
+    console.warn(`audio source ${srcIdx + 1}/${srcList.length} failed (${reason})`, audioEl.error || "");
+    if (srcIdx + 1 < srcList.length) {
+        srcIdx++;
+        loadCurrentSource();
+        if (isPlaying) startPlayback();
         return;
     }
+    trackFailed();
+}
 
-    if (!audioEl.src) return;
+function trackFailed() {
+    clearStall();
+    failStreak++;
+    if (isPlaying && failStreak < MAX_FAIL_STREAK && tracks.length > 1) {
+        showTrack(trackIndex + 1);
+    } else {
+        setPlayUi(false);
+        failStreak = 0;
+        setLyricText("couldn't play this track, try another");
+    }
+}
 
-    // update UI immediately; don't wait on the network
-    setPlayUi(true);
-
+async function startPlayback() {
+    const token = ++playToken;
+    const mine = session;
     try {
         await audioEl.play();
-        if (token === playToken) failStreak = 0;
+        if (token === playToken && mine === session) failStreak = 0;
     } catch (err) {
         // superseded by a newer play/pause/track change
-        if (err?.name === "AbortError" || token !== playToken) return;
-        console.error("Audio playback failed:", {
-            error: err,
-            src: audioEl.currentSrc,
-            networkState: audioEl.networkState,
-            readyState: audioEl.readyState,
-            mediaError: audioEl.error,
-        });
-        // browser blocked playback; media errors are handled by the "error" listener
+        if (err?.name === "AbortError" || token !== playToken || mine !== session) return;
+        console.error("Audio playback failed:", err);
+        // browser wants a user gesture; real media failures arrive via the "error" event / stall watchdog
         if (err?.name === "NotAllowedError") setPlayUi(false);
     }
 }
 
+function setPlaying(state) {
+    if (!state) {
+        playToken++;
+        setPlayUi(false);
+        audioEl.pause();
+        return;
+    }
+    if (!srcList.length) return;
+    setPlayUi(true); // update UI immediately; don't wait on the network
+    startPlayback();
+}
+
+audioEl.addEventListener("playing", () => { clearStall(); failStreak = 0; });
+audioEl.addEventListener("canplay", clearStall);
+audioEl.addEventListener("loadeddata", clearStall);
+
+audioEl.addEventListener("error", () => {
+    if (!audioEl.getAttribute("src")) return; // fired by clearing the source, not a real failure
+    advanceSource("media error");
+});
+
+audioEl.addEventListener("timeupdate", () => {
+    updateLyricForTime(audioEl.currentTime + currentPreviewOffset);
+});
+
+audioEl.addEventListener("ended", () => {
+    // showTrack already resumes playback when isPlaying
+    showTrack(trackIndex + 1);
+});
+
+// ---------------------------------------------------------------
+// QUEUE / TRACK UI
+// ---------------------------------------------------------------
 function updateQueuePage() {
     const page = Math.floor(trackIndex / PLAYLIST_PAGE_SIZE);
     const start = page * PLAYLIST_PAGE_SIZE;
@@ -555,27 +668,35 @@ function showTrack(index) {
     trackIndex = (index + tracks.length) % tracks.length;
     const track = tracks[trackIndex];
 
+    session++;
+    clearStall();
+
     musicTtl.textContent = track.name;
     musicArtist.textContent = track.artist;
     musicArt.src = track.cover;
 
-    triedDirect = false;
     audioEl.pause();
-    audioEl.src = track.id
-        ? `/api/preview?id=${encodeURIComponent(track.id)}`
-        : track.preview || "";
-    audioEl.load();
+    srcList = sourcesFor(track);
+    srcIdx = 0;
+
+    if (srcList.length) {
+        loadCurrentSource();
+    } else {
+        audioEl.removeAttribute("src");
+        audioEl.load();
+    }
 
     updateQueuePage();
     updateMusicCount();
 
     loadLyrics(track);
 
-    if (isPlaying) {
-        setPlaying(true);
-    } else {
-        setPlayUi(false);
+    if (!srcList.length) {
+        trackFailed();
+        return;
     }
+    if (isPlaying) startPlayback();
+    else setPlayUi(false);
 }
 
 function renderQueue() {
@@ -589,93 +710,250 @@ function renderQueue() {
     updateQueuePage();
 }
 
+// ---------------------------------------------------------------
 // LYRICS
-function parseLrc(lrcText) {
-    const lines = lrcText.split("\n");
-    const parsed = [];
+// ---------------------------------------------------------------
+// Parsing and matching live in /lib/lyrics-match.js, the same file the server uses.
+let matchLib = null;
+function getMatchLib() {
+    if (!matchLib) matchLib = import("/lib/lyrics-match.js").catch((err) => { matchLib = null; throw err; });
+    return matchLib;
+}
 
-    for (const line of lines) {
-        const match = line.match(/\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\](.*)/);
-        if (!match) continue;
+let lyricLines = [];
+let lyricsToken = 0;
+let lyricsAbort = null;
+let lyricsState = "idle"; // idle | loading | ready | none | error
 
-        const minutes = parseInt(match[1], 10);
-        const seconds = parseInt(match[2], 10);
-        const ms = match[3] ? parseInt(match[3].padEnd(3, "0"), 10) : 0;
-        const time = minutes * 60 + seconds + ms / 1000;
-        const text = match[4].trim().toLowerCase();
+const LYRIC_CACHE_INDEX = "lyrics:index:v2";
+const LYRIC_CACHE_MAX = 80;
 
-        if (text) parsed.push({ time, text });
+function lyricCacheKey(track) {
+    return `lyrics:v2:${track.id || `${track.artist}|${track.name}`}`;
+}
+
+function lyricCacheGet(track) {
+    const hit = store.get(lyricCacheKey(track));
+    return hit && (hit.lrc || hit.plain || hit.instrumental) ? hit : null;
+}
+
+function lyricCachePut(track, value) {
+    const key = lyricCacheKey(track);
+    store.set(key, value);
+    const index = (store.get(LYRIC_CACHE_INDEX) || []).filter((k) => k !== key);
+    index.push(key);
+    while (index.length > LYRIC_CACHE_MAX) {
+        try { localStorage.removeItem(index.shift()); } catch (_) {}
+    }
+    store.set(LYRIC_CACHE_INDEX, index);
+}
+
+// Ask our own API. Returns { lrc } | { instrumental } | { none } | { retry }
+async function lyricsFromServer(track, signal) {
+    const qs = new URLSearchParams({ artist: track.artist, title: track.name });
+    if (track.album) qs.set("album", track.album);
+    if (track.duration) qs.set("duration", String(track.duration));
+
+    let res;
+    try {
+        res = await fetchTimeout(`/api/lyrics?${qs}`, 20000, signal);
+    } catch (err) {
+        if (signal.aborted) throw err;
+        return { retry: true };
     }
 
-    return parsed;
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+
+    if (res.ok && data?.syncedLyrics) return { lrc: data.syncedLyrics };
+    if (res.ok && data?.plainLyrics) return { plain: data.plainLyrics };
+    if (res.ok && data?.instrumental) return { instrumental: true };
+    if (res.status === 404 && data?.notFound) return { none: true };
+    return { retry: true }; // 5xx, 503 retryable, HTML error page, anything unexpected
+}
+
+// Same lookup straight from the browser. Covers the case where lrclib blocks / rate-limits our server's IP.
+async function lyricsFromBrowser(track, signal) {
+    let lib;
+    try { lib = await getMatchLib(); } catch (_) { return { retry: true }; }
+
+    const urls = [
+        `https://lrclib.net/api/search?${new URLSearchParams({ q: `${lib.primaryArtist(track.artist)} ${lib.cleanTitle(track.name)}` })}`,
+        `https://lrclib.net/api/search?${new URLSearchParams({ track_name: track.name, artist_name: track.artist })}`,
+    ];
+
+    let failed = false;
+    const pool = [];
+    await Promise.all(urls.map(async (u) => {
+        try {
+            const res = await fetchTimeout(u, 9000, signal);
+            if (res.status === 404) return;
+            if (!res.ok) { failed = true; return; }
+            const data = await res.json();
+            if (Array.isArray(data)) pool.push(...data);
+        } catch (err) {
+            if (signal.aborted) throw err;
+            failed = true;
+        }
+    }));
+
+    const best = lib.pickBest(pool, { artist: track.artist, title: track.name, duration: track.duration });
+    if (best) return best.synced ? { lrc: best.record.syncedLyrics } : { plain: best.record.plainLyrics };
+    return failed ? { retry: true } : { none: true };
+}
+
+function showLyricsError(track) {
+    lyricsState = "error";
+    setLyricText("lyrics didn't load, tap to retry");
 }
 
 async function loadLyrics(track) {
     const myToken = ++lyricsToken;
+    if (lyricsAbort) lyricsAbort.abort();
+    const abort = (lyricsAbort = new AbortController());
+
     lyricLines = [];
+    lyricsState = "loading";
     currentPreviewOffset = getPreviewOffset(track);
+
+    const apply = async (value) => {
+        const lib = await getMatchLib(); // throws if the module can't load -> error state, not "no lyrics"
+        const lines = value.plain ? lib.spreadPlain(value.plain, track.duration) : lib.parseLrc(value.lrc);
+        if (myToken !== lyricsToken) return true;
+        if (!lines.length) return false;
+        lyricLines = lines;
+        lyricsState = "ready";
+        lyricShown = null;
+        updateLyricForTime(audioEl.currentTime + currentPreviewOffset);
+        return true;
+    };
+
+    const cached = lyricCacheGet(track);
+    if (cached?.instrumental) {
+        lyricsState = "none";
+        setLyricText("♪ instrumental ♪");
+        return;
+    }
+    if (cached?.lrc || cached?.plain) {
+        try { if (await apply(cached)) return; } catch (_) {}
+    }
+
     setLyricText("looking for lyrics...");
 
     try {
-        const durationParam = track.duration ? `&duration=${encodeURIComponent(track.duration)}` : "";
-        const res = await fetch(`/api/lyrics?artist=${encodeURIComponent(track.artist)}&title=${encodeURIComponent(track.name)}${durationParam}`);
-        const data = await res.json();
-        if (myToken !== lyricsToken) return;
+        const delays = [0, 900, 2500, 5000];
+        for (let attempt = 0; attempt < delays.length; attempt++) {
+            if (delays[attempt]) await sleep(delays[attempt]);
+            if (myToken !== lyricsToken) return;
 
-        if (!data.syncedLyrics) {
-            setLyricText("no lyrics yet");
-            return;
+            let out = await lyricsFromServer(track, abort.signal);
+            if (myToken !== lyricsToken) return;
+
+            // our server could not get an answer from lrclib: ask lrclib straight from this browser
+            if (out.retry && attempt >= 1) {
+                out = await lyricsFromBrowser(track, abort.signal);
+                if (myToken !== lyricsToken) return;
+            }
+
+            if (out.instrumental) {
+                lyricCachePut(track, { instrumental: true });
+                lyricsState = "none";
+                setLyricText("♪ instrumental ♪");
+                return;
+            }
+            if (out.lrc || out.plain) {
+                if (await apply(out)) {
+                    if (myToken === lyricsToken) lyricCachePut(track, out.lrc ? { lrc: out.lrc } : { plain: out.plain });
+                    return;
+                }
+                out = { none: true }; // unusable payload: behaves like "no lyrics"
+            }
+            if (out.none) {
+                lyricsState = "none";
+                setLyricText("no lyrics yet");
+                return;
+            }
+            // out.retry -> loop again
         }
-
-        lyricLines = parseLrc(data.syncedLyrics);
-
-        if (!lyricLines.length) {
-            setLyricText("no lyrics yet");
-            return;
-        }
-
-        updateLyricForTime(currentPreviewOffset);
+        showLyricsError(track); // only reached after every attempt genuinely failed
     } catch (err) {
-        if (myToken !== lyricsToken) return;
-        setLyricText("lyrics didn't load, try again later");
+        if (myToken !== lyricsToken || abort.signal.aborted) return;
         console.error(err);
+        showLyricsError(track);
     }
 }
+
+musicLyric.addEventListener("click", () => {
+    if (lyricsState === "error" && tracks[trackIndex]) loadLyrics(tracks[trackIndex]);
+});
 
 function updateLyricForTime(currentTime) {
     if (!lyricLines.length) return;
 
-    let activeLine = lyricLines[0];
-    for (const line of lyricLines) {
-        if (line.time <= currentTime) {
-            activeLine = line;
-        } else {
-            break;
-        }
+    // binary search: last line whose time <= currentTime
+    let lo = 0;
+    let hi = lyricLines.length - 1;
+    let idx = 0;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (lyricLines[mid].time <= currentTime) { idx = mid; lo = mid + 1; }
+        else hi = mid - 1;
     }
-    setLyricText(activeLine.text);
+    setLyricText(lyricLines[idx].text);
 }
 
-async function loadPlaylist() {
-    try {
-        const res = await fetch("/api/playlist");
-        if (!res.ok) throw new Error(`playlist ${res.status}`);
-        const data = await res.json();
-        tracks = data.tracks;
+// ---------------------------------------------------------------
+// PLAYLIST LOADING
+// ---------------------------------------------------------------
+const PLAYLIST_CACHE_KEY = "playlist:v2";
 
-        if (!tracks || !tracks.length) {
-            queueEl.innerHTML = "<p>no tracks found.</p>";
-            return;
+async function fetchPlaylistWithRetry() {
+    const delays = [0, 600, 1800];
+    let lastErr;
+    for (const d of delays) {
+        if (d) await sleep(d);
+        try {
+            const res = await fetchTimeout("/api/playlist", 15000);
+            if (!res.ok) throw new Error(`playlist ${res.status}`);
+            const data = await res.json();
+            if (Array.isArray(data?.tracks) && data.tracks.length) return data.tracks;
+            throw new Error("empty playlist");
+        } catch (err) {
+            lastErr = err;
+        }
+    }
+    throw lastErr;
+}
+
+let playlistLoading = false;
+async function loadPlaylist() {
+    if (playlistLoading) return;
+    playlistLoading = true;
+    queueEl.innerHTML = "<p>loading tracks...</p>";
+
+    try {
+        let list;
+        try {
+            list = await fetchPlaylistWithRetry();
+            store.set(PLAYLIST_CACHE_KEY, list);
+        } catch (err) {
+            console.error(err);
+            list = store.get(PLAYLIST_CACHE_KEY); // last good copy; audio is resolved by id server-side anyway
+            if (!Array.isArray(list) || !list.length) throw err;
         }
 
+        tracks = list;
         renderQueue();
-
-        const randomIndex = Math.floor(Math.random() * tracks.length);
-        showTrack(randomIndex);
-
+        showTrack(Math.floor(Math.random() * tracks.length));
     } catch (err) {
-        queueEl.innerHTML = "<p>couldn't load playlist.</p>";
-        console.error(err);
+        queueEl.innerHTML = "";
+        const p = document.createElement("p");
+        p.textContent = "couldn't load playlist. click to retry.";
+        p.style.cursor = "pointer";
+        p.addEventListener("click", loadPlaylist);
+        queueEl.appendChild(p);
+    } finally {
+        playlistLoading = false;
     }
 }
 
@@ -688,44 +966,10 @@ musBackBtn.addEventListener("click", () => showTrack(trackIndex - 1));
 musNextBtn.addEventListener("click", () => showTrack(trackIndex + 1));
 musPlayBtn.addEventListener("click", () => setPlaying(!isPlaying));
 
-audioEl.addEventListener("timeupdate", () => {
-    updateLyricForTime(audioEl.currentTime + currentPreviewOffset);
-});
-
-audioEl.addEventListener("error", () => {
-    console.error("Audio element error:", {
-        src: audioEl.currentSrc,
-        networkState: audioEl.networkState,
-        readyState: audioEl.readyState,
-        mediaError: audioEl.error,
-    });
-
-    const track = tracks[trackIndex];
-    if (!track || !audioEl.src) return;
-
-    // 1) retry once with the direct Deezer preview URL
-    if (!triedDirect && track.preview && !audioEl.src.endsWith(track.preview)) {
-        triedDirect = true;
-        audioEl.src = track.preview;
-        audioEl.load();
-        if (isPlaying) setPlaying(true);
-        return;
-    }
-
-    // 2) skip to the next track while playing; give up after repeated failures
-    failStreak++;
-    if (isPlaying && failStreak < MAX_FAIL_STREAK && tracks.length > 1) {
-        showTrack(trackIndex + 1);
-    } else {
-        setPlayUi(false);
-        failStreak = 0;
-        setLyricText("couldn't play this track, try another");
-    }
-});
-
-audioEl.addEventListener("ended", () => {
-    // showTrack already resumes playback when isPlaying
-    showTrack(trackIndex + 1);
+// coming back online: retry whatever was stuck
+window.addEventListener("online", () => {
+    if (!tracks.length) loadPlaylist();
+    else if (lyricsState === "error" && tracks[trackIndex]) loadLyrics(tracks[trackIndex]);
 });
 
 loadPreviewOffsets().then(loadPlaylist);

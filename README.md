@@ -44,6 +44,18 @@ npx wrangler kv key put --binding=SITE_KV "offsets" --path=offsets.json
 
 Re-run `put` on content changes.
 
+## Music player reliability notes
+
+- `lib/lyrics-match.js` is shared by `functions/api/lyrics.js` and the browser. It normalizes titles/artists
+  (remaster/feat/live suffixes), scores lrclib candidates by title, artist and duration, and parses LRC.
+- `/api/lyrics` answers 404 only when lrclib really has nothing. Provider outages return 503 (never cached),
+  and the page retries, then asks lrclib directly from the browser, before showing "tap to retry".
+- `/api/preview` downloads and validates the whole clip, then serves 200/206/416 itself. It uses the page's
+  preview URL as a hint, falls back to a fresh Deezer lookup, then a Deezer search for the same song.
+- `/api/playlist` pages through big playlists and keeps a last-good copy in KV (`playlist:v2`).
+  Lyrics are cached in KV as `lyrics:v2:*`. These keys do not touch `posts` / `offsets`.
+- `npm test` runs offline tests against mocked Deezer and lrclib.
+
 ## License
 
 Personal project. Not licensed for reuse.

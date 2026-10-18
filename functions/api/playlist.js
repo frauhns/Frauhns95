@@ -1,80 +1,84 @@
+import { deezerJson } from "../../lib/deezer.js";
+
 const PLAYLIST_ID = "15656484663";
-const FRESH_S = 60;          // serve cached copy without hitting Deezer
-const STALE_S = 60 * 60 * 24; // keep last good copy for outages
+const FRESH_S = 60;                 // browsers/edge may reuse this long
+const KV_KEY = "playlist:v2";       // last known-good copy, survives Deezer outages and cold edges
+const KV_REWRITE_S = 60 * 60 * 6;  // KV has a small daily write budget; only rewrite when changed or old
 
 function json(body, status = 200, cache = "no-store") {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json", "Cache-Control": cache },
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": cache },
   });
 }
 
-async function fetchPlaylist() {
-  for (let i = 0; i < 2; i++) {
+function mapTrack(t) {
+  return {
+    id: t.id,
+    name: t.title,
+    artist: t.artist?.name ?? "",
+    album: t.album?.title ?? "",
+    cover: t.album?.cover_medium ?? t.album?.cover_big ?? t.album?.cover ?? "",
+    url: t.link,
+    preview: t.preview || "",
+    duration: t.duration,
+  };
+}
+
+async function fetchTracks() {
+  const pl = await deezerJson(`/playlist/${PLAYLIST_ID}`);
+  const all = Array.isArray(pl?.tracks?.data) ? [...pl.tracks.data] : [];
+  const total = Number(pl?.nb_tracks) || all.length;
+
+  // The embedded list can be truncated on big playlists; page through the rest.
+  for (let guard = 0; all.length < total && guard < 20; guard++) {
+    let page;
     try {
-      const res = await fetch(`https://api.deezer.com/playlist/${PLAYLIST_ID}`, {
-        signal: AbortSignal.timeout(8000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data && !data.error && data.tracks && Array.isArray(data.tracks.data)) return data;
-      }
-    } catch (_) {}
-    await new Promise(r => setTimeout(r, 250));
+      page = await deezerJson(`/playlist/${PLAYLIST_ID}/tracks?index=${all.length}&limit=100`);
+    } catch (_) {
+      break; // keep what we have rather than failing the whole player
+    }
+    if (!Array.isArray(page?.data) || !page.data.length) break;
+    all.push(...page.data);
   }
-  return null;
+
+  const seen = new Set();
+  return all
+    .filter((t) => t && t.id && !seen.has(t.id) && seen.add(t.id))
+    .map(mapTrack);
 }
 
 export async function onRequest(context) {
-  const cache = caches.default;
-  const cacheKey = new Request(new URL("/api/playlist?v=2", context.request.url).toString());
+  const kv = context.env?.SITE_KV;
 
   try {
-    const cached = await cache.match(cacheKey);
-    const age = cached ? (Date.now() - Number(cached.headers.get("X-Cached-At") || 0)) / 1000 : Infinity;
+    const tracks = await fetchTracks();
+    if (!tracks.length) throw new Error("empty playlist");
 
-    if (cached && age < FRESH_S) return cached;
-
-    const data = await fetchPlaylist();
-
-    // Deezer down or rate-limited: serve last good copy instead of breaking the player.
-    if (!data) {
-      if (cached) return cached;
-      return json({ error: "Deezer unavailable" }, 502);
+    if (kv) {
+      context.waitUntil(
+        (async () => {
+          try {
+            const prev = await kv.get(KV_KEY, "json");
+            const sig = (list) => list.map((t) => t.id).join(",");
+            const stale = !prev || Date.now() - (prev.at || 0) > KV_REWRITE_S * 1000;
+            if (stale || sig(prev.tracks || []) !== sig(tracks)) {
+              await kv.put(KV_KEY, JSON.stringify({ at: Date.now(), tracks }));
+            }
+          } catch (_) {}
+        })()
+      );
     }
 
-    const tracks = data.tracks.data
-      .filter(track => track && track.id)
-      .map(track => ({
-        id: track.id,
-        name: track.title,
-        artist: track.artist?.name ?? "",
-        album: track.album?.title ?? "",
-        cover: track.album?.cover_medium ?? "",
-        url: track.link,
-        preview: track.preview,
-        duration: track.duration,
-      }));
-
-    if (!tracks.length) {
-      if (cached) return cached;
-      return json({ error: "Empty playlist from Deezer" }, 502);
-    }
-
-    const body = JSON.stringify({ tracks });
-    const toStore = new Response(body, {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": `public, max-age=${STALE_S}`,
-        "X-Cached-At": String(Date.now()),
-      },
-    });
-    context.waitUntil(cache.put(cacheKey, toStore));
-
-    return new Response(body, {
-      headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${FRESH_S}` },
-    });
+    return json({ tracks }, 200, `public, max-age=${FRESH_S}, stale-while-revalidate=300`);
   } catch (err) {
-    return json({ error: err.message }, 500);
+    // Deezer is down / rate limited: serve the last good copy instead of breaking the player.
+    if (kv) {
+      try {
+        const prev = await kv.get(KV_KEY, "json");
+        if (prev?.tracks?.length) return json({ tracks: prev.tracks, stale: true }, 200, "no-store");
+      } catch (_) {}
+    }
+    return json({ error: err?.message || "Deezer unavailable" }, 502);
   }
 }
