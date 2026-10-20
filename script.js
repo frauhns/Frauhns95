@@ -543,15 +543,34 @@ let stallTimer = null;
 let failStreak = 0;
 
 function sourcesFor(track) {
+    // Order matters: the visitor's own browser is the most reliable path (own IP, no shared quota,
+    // no Cloudflare function usage). Our proxy is only the backup.
     const list = [];
+    if (track.id) list.push(RESOLVE);
+    if (track.preview) list.push(track.preview);
     if (track.id) {
         const id = encodeURIComponent(track.id);
         const hint = track.preview ? `&hint=${encodeURIComponent(track.preview)}` : "";
         list.push(`/api/preview?id=${id}${hint}`);
         list.push(`/api/preview?id=${id}&refresh=1&_=${Date.now()}`);
     }
-    if (track.preview) list.push(track.preview);
     return list;
+}
+
+// Ask Deezer from the visitor's browser (JSONP, since the API has no CORS). Uses the visitor's own IP,
+// so it avoids the shared-Cloudflare-IP quota that breaks the server-side proxy.
+const RESOLVE = "resolve:deezer";
+function deezerPreviewFromBrowser(id) {
+    return new Promise((resolve) => {
+        const cb = `dz_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+        const el = document.createElement("script");
+        const done = (v) => { clearTimeout(t); delete window[cb]; el.remove(); resolve(v); };
+        const t = setTimeout(() => done(null), 8000);
+        window[cb] = (d) => done(d && d.preview ? d.preview : null);
+        el.onerror = () => done(null);
+        el.src = `https://api.deezer.com/track/${encodeURIComponent(id)}?output=jsonp&callback=${cb}`;
+        document.head.appendChild(el);
+    });
 }
 
 function clearStall() {
@@ -568,7 +587,23 @@ function armStall() {
 }
 
 function loadCurrentSource() {
-    audioEl.src = srcList[srcIdx];
+    const src = srcList[srcIdx];
+    if (src === RESOLVE) {
+        const mine = session;
+        const myIdx = srcIdx;
+        const track = tracks[trackIndex];
+        armStall();
+        deezerPreviewFromBrowser(track.id).then((url) => {
+            if (mine !== session || myIdx !== srcIdx) return;
+            if (!url) { advanceSource("browser resolve failed"); return; }
+            audioEl.src = url;
+            audioEl.load();
+            armStall();
+            if (isPlaying) startPlayback();
+        });
+        return;
+    }
+    audioEl.src = src;
     audioEl.load();
     armStall();
 }
@@ -589,7 +624,8 @@ function trackFailed() {
     clearStall();
     failStreak++;
     if (isPlaying && failStreak < MAX_FAIL_STREAK && tracks.length > 1) {
-        showTrack(trackIndex + 1);
+        const mine = session;
+        setTimeout(() => { if (mine === session && isPlaying) showTrack(trackIndex + 1); }, 1500);
     } else {
         setPlayUi(false);
         failStreak = 0;
